@@ -35,6 +35,7 @@ A comprehensive Python-based system for automatic audio stream routing in PipeWi
   - `config_parser.py`: YAML configuration parsing
   - `audio_router_engine.py`: Routing logic engine (pactl-based stream routing)
   - `intelligent_audio_router.py`: Intelligent device classification and automatic config generation
+  - `tray_icon.py`: System tray icon (KDE Plasma and Gnome)
 
 - **config/**: Configuration files
   - `routing_rules.yaml`: Auto-generated routing configuration
@@ -52,6 +53,7 @@ A comprehensive Python-based system for automatic audio stream routing in PipeWi
 - CLI and daemon modes
 - SystemD integration with auto-config generation on startup
 - Device hotplug detection and rule application (every 5 seconds)
+- **System tray icon** - Optional tray icon for KDE Plasma and Gnome with pause/resume and config regeneration
 - PipeWire auto-routing disabled to prevent conflicts with manual routing
 
 ## Usage
