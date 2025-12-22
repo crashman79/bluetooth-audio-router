@@ -7,14 +7,15 @@
 - Example: `journalctl --user -u pipewire-router --no-pager`
 - Example: `systemctl --user status pipewire-router --no-pager`
 
-### Fish Shell Compatibility
-- User's shell is fish, not bash/zsh
-- Do NOT use bash-specific syntax (heredocs, etc.)
-- Use `printf` or `echo` instead of heredocs for multiline strings
-- Venv activation scripts are NOT compatible with fish - use direct Python path instead:
-  - Use: `~/.config/pipewire-router/venv/bin/python3 script.py`
-  - Don't use: `source venv/bin/activate`
-- When generating terminal commands, ensure they work with fish syntax
+### Shell Usage - Use Bash Instead of Fish
+- **User's default shell is fish, but use bash for all terminal commands and scripts**
+- Fish shell has significant compatibility issues and unexpected behavior quirks
+- When running commands in the terminal, explicitly use bash:
+  - Use: `bash -c "command here"` or start an interactive bash session
+  - Use bash syntax for scripts (heredocs, source commands, etc.)
+  - Venv activation: `source ~/.config/pipewire-router/venv/bin/activate`
+- Do NOT generate fish-specific syntax - use standard bash/sh syntax instead
+- This avoids unexpected behavior and ensures commands work reliably
 
 ### Arch Linux / CachyOS Specifics
 - User is running CachyOS (Arch Linux flavor)
