@@ -27,18 +27,18 @@ class AudioRouterEngine:
         self.force_bluetooth_mono = force_bluetooth_mono
         self._mono_sink_cache: Dict[str, str] = {}
         self._required_mono_masters: Set[str] = set()
-        # Clean stale remap modules from earlier sessions.
+        # Clean stale remap modules from prior runs to avoid nested leftovers.
         self._cleanup_sinkswitch_remaps(startup=True)
 
     def _normalize_master_sink_name(self, sink_name: str) -> str:
-        """Unwrap SinkSwitch mono remap sink names to their physical master sink."""
+        """Unwrap SinkSwitch mono remap sink names to their underlying master sink."""
         out = sink_name or ''
         while out.startswith(self.MONO_REMAP_PREFIX):
             out = out[len(self.MONO_REMAP_PREFIX):]
         return out
 
     def _list_sinkswitch_remap_modules(self) -> List[Dict[str, str]]:
-        """Return module rows for SinkSwitch-managed remap sinks."""
+        """Return remap module rows for SinkSwitch-managed mono sinks."""
         modules: List[Dict[str, str]] = []
         try:
             result = subprocess.run(
@@ -78,7 +78,7 @@ class AudioRouterEngine:
             return modules
 
     def _get_sink_states(self) -> Dict[str, str]:
-        """Return mapping sink_name -> state from pactl list short sinks."""
+        """Return mapping sink_name -> state from ``pactl list short sinks``."""
         states: Dict[str, str] = {}
         try:
             result = subprocess.run(
@@ -104,12 +104,18 @@ class AudioRouterEngine:
             return states
 
     def _cleanup_sinkswitch_remaps(self, startup: bool = False) -> None:
-        """Unload stale SinkSwitch mono remap modules."""
+        """Unload stale SinkSwitch mono remap modules.
+
+        During runtime, only unload non-running sinks that are not currently required.
+        During startup, unload all SinkSwitch remap sinks to clean previous session state.
+        """
         modules = self._list_sinkswitch_remap_modules()
         if not modules:
             return
 
         sink_states = self._get_sink_states()
+        removed = 0
+        # Unload nested sinks first (longer names first).
         modules_sorted = sorted(modules, key=lambda m: len(m.get('sink_name', '')), reverse=True)
 
         for mod in modules_sorted:
@@ -135,9 +141,22 @@ class AudioRouterEngine:
             )
             if unload_res.returncode == 0:
                 self._mono_sink_cache.pop(master, None)
+                removed += 1
+            else:
+                err = (unload_res.stderr or unload_res.stdout or '').strip()
+                logger.debug(
+                    "Failed to unload SinkSwitch remap module %s (%s): %s",
+                    module_id,
+                    sink_name,
+                    err or f"exit {unload_res.returncode}",
+                )
+
+        if removed:
+            phase = 'startup' if startup else 'runtime'
+            logger.info("Cleaned %d stale SinkSwitch remap module(s) during %s", removed, phase)
 
     def _get_sink_channel_count(self, sink_name: str) -> Optional[int]:
-        """Return sink channel count parsed from pactl list sinks."""
+        """Return sink channel count parsed from ``pactl list sinks``."""
         try:
             result = subprocess.run(
                 host_cmd(['pactl', 'list', 'sinks']),
@@ -180,32 +199,60 @@ class AudioRouterEngine:
             return None
 
     def _is_single_channel_bluetooth_sink(self, sink_name: str) -> bool:
-        """Detect Bluetooth sinks that currently report one output channel."""
+        """Detect Bluetooth sinks that currently report one channel."""
         if 'bluez' not in (sink_name or '').lower():
             return False
-        return self._get_sink_channel_count(sink_name) == 1
+        channel_count = self._get_sink_channel_count(sink_name)
+        return channel_count == 1
 
     def _find_existing_mono_remap_sink(self, master_sink: str) -> Optional[str]:
-        """Return existing mono remap sink name for master_sink, if present."""
+        """Return existing mono remap sink name for a master sink, if present."""
         normalized_master = self._normalize_master_sink_name(master_sink)
-        for mod in self._list_sinkswitch_remap_modules():
-            found_master = self._normalize_master_sink_name(mod.get('master', ''))
-            if found_master == normalized_master:
-                sink_name = mod.get('sink_name', '')
-                if sink_name:
-                    return sink_name
-        return None
+        try:
+            result = subprocess.run(
+                host_cmd(['pactl', 'list', 'short', 'modules']),
+                capture_output=True,
+                text=True,
+                **SUBPROCESS_TEXT_KW,
+                timeout=5,
+            )
+            if result.returncode != 0:
+                return None
+
+            for raw_line in result.stdout.split('\n'):
+                line = raw_line.strip()
+                if not line or 'module-remap-sink' not in line:
+                    continue
+                if 'master=' not in line:
+                    continue
+                master_match = re.search(r'\bmaster=([^\s]+)', line)
+                if not master_match:
+                    continue
+                found_master = self._normalize_master_sink_name(master_match.group(1))
+                if found_master != normalized_master:
+                    continue
+                sink_match = re.search(r'\bsink_name=([^\s]+)', line)
+                if sink_match:
+                    sink_name = sink_match.group(1)
+                    if sink_name.startswith(self.MONO_REMAP_PREFIX):
+                        return sink_name
+            return None
+        except Exception as e:
+            logger.debug(f"Failed to list remap sinks for {master_sink}: {e}")
+            return None
 
     def _ensure_mono_remap_sink(self, master_sink: str) -> str:
         """Create/reuse a mono remap sink for master_sink; return sink to route to."""
         master_sink = self._normalize_master_sink_name(master_sink)
         cached = self._mono_sink_cache.get(master_sink)
         if cached and self._resolve_sink(cached):
+            self._ensure_remap_stream_on_master_sink(master_sink)
             return cached
 
         existing = self._find_existing_mono_remap_sink(master_sink)
         if existing and self._resolve_sink(existing):
             self._mono_sink_cache[master_sink] = existing
+            self._ensure_remap_stream_on_master_sink(master_sink)
             return existing
 
         sanitized = re.sub(r'[^a-zA-Z0-9_.-]', '_', master_sink)
@@ -219,7 +266,7 @@ class AudioRouterEngine:
                 'module-remap-sink',
                 f'sink_name={mono_sink_name}',
                 f'master={master_sink}',
-                f'sink_properties=device.description={sink_desc}',
+            f'sink_properties=device.description={sink_desc}',
                 'channels=1',
                 'channel_map=mono',
                 'remix=yes',
@@ -241,34 +288,34 @@ class AudioRouterEngine:
             return master_sink
 
         if self._resolve_sink(mono_sink_name):
+            logger.info("Created mono remap sink %s for %s", mono_sink_name, master_sink)
             self._mono_sink_cache[master_sink] = mono_sink_name
+            self._ensure_remap_stream_on_master_sink(master_sink)
             return mono_sink_name
+
+        logger.warning("Mono remap sink %s was created but not resolvable; using %s", mono_sink_name, master_sink)
         return master_sink
 
     def _get_effective_target_sink(self, sink_name: str) -> str:
-        """Return sink name to route to, enabling mono for Bluetooth when configured."""
+        """Return sink name to route to, enabling mono for single-channel Bluetooth."""
         if 'bluez' not in (sink_name or '').lower():
             return sink_name
-
         master_sink = self._normalize_master_sink_name(sink_name)
         if self.force_bluetooth_mono:
             mono_sink = self._ensure_mono_remap_sink(master_sink)
+            if mono_sink != sink_name:
+                logger.info("Forced Bluetooth mono enabled for %s; routing via %s", sink_name, mono_sink)
             self._required_mono_masters.add(master_sink)
             return mono_sink
-
         if not self.auto_mono_single_channel_bluetooth:
             return sink_name
         if not self._is_single_channel_bluetooth_sink(master_sink):
             return sink_name
-
         mono_sink = self._ensure_mono_remap_sink(master_sink)
+        if mono_sink != sink_name:
+            logger.info("Single-channel Bluetooth sink detected for %s; routing via %s", sink_name, mono_sink)
         self._required_mono_masters.add(master_sink)
         return mono_sink
-
-    def cleanup_managed_sinks(self) -> None:
-        """Public cleanup helper used when stopping the in-app monitor."""
-        self._required_mono_masters = set()
-        self._cleanup_sinkswitch_remaps(startup=True)
     
     def _ensure_a2dp_profile(self, sink_name: str) -> bool:
         """Ensure Bluetooth device is using A2DP (high-fidelity) profile
@@ -372,7 +419,10 @@ class AudioRouterEngine:
             # Route matching applications to target device (try all variants)
             effective_targets: List[str] = []
             for target in all_targets:
-                effective_targets.append(self._get_effective_target_sink(target))
+                resolved_target = self._get_effective_target_sink(target)
+                if resolved_target not in effective_targets:
+                    effective_targets.append(resolved_target)
+
             routed = self._route_applications(
                 applications,
                 keywords,
@@ -478,7 +528,7 @@ class AudioRouterEngine:
         return False
 
     def _get_sink_inputs(self) -> List[Dict[str, str]]:
-        """Return sink-input rows with index, sink (numeric id), and application_name."""
+        """Return sink-input rows with index, sink, and metadata used for filtering."""
         try:
             result = subprocess.run(
                 host_cmd(['pactl', 'list', 'sink-inputs']),
@@ -507,6 +557,12 @@ class AudioRouterEngine:
                 elif 'application.name' in line and '=' in line:
                     app_name = line.split('=', 1)[1].strip().strip('"')
                     current['application_name'] = app_name
+                elif 'media.name' in line and '=' in line:
+                    media_name = line.split('=', 1)[1].strip().strip('"')
+                    current['media_name'] = media_name
+                elif 'node.name' in line and '=' in line:
+                    node_name = line.split('=', 1)[1].strip().strip('"')
+                    current['node_name'] = node_name
 
             if current and current.get('index'):
                 streams.append(current)
@@ -514,6 +570,19 @@ class AudioRouterEngine:
         except Exception as e:
             logger.debug(f"Failed to read sink inputs: {e}")
             return []
+
+    def _is_internal_mono_remap_stream(self, stream: Dict[str, str]) -> bool:
+        """Return True when sink-input is the internal stream of our mono remap sink."""
+        node_name = (stream.get('node_name') or '').lower()
+        media_name = (stream.get('media_name') or '').lower()
+        app_name = (stream.get('application_name') or '').lower()
+        if 'sinkswitch_mono.' in node_name:
+            return True
+        if 'remapped ' in media_name and 'bluez_output.' in media_name:
+            return True
+        if app_name.startswith('sinkswitch_mono.'):
+            return True
+        return False
 
     def _move_sink_input(self, sink_input_id: str, target_sink_name: str, target_sink_id: str) -> bool:
         """Move one sink-input, trying sink name first then numeric id."""
@@ -538,6 +607,26 @@ class AudioRouterEngine:
         )
         return False
 
+    def _ensure_remap_stream_on_master_sink(self, master_sink: str) -> None:
+        """Move mono remap internal stream back to master sink if fallback displaced it."""
+        master_resolved = self._resolve_sink(master_sink)
+        if not master_resolved:
+            return
+        master_sink_id, master_sink_name = master_resolved
+        for stream in self._get_sink_inputs():
+            if not self._is_internal_mono_remap_stream(stream):
+                continue
+            sink_input_id = stream.get('index')
+            current_sink_id = stream.get('sink')
+            if not sink_input_id or not current_sink_id or current_sink_id == master_sink_id:
+                continue
+            if self._move_sink_input(sink_input_id, master_sink_name, master_sink_id):
+                logger.info(
+                    "Moved internal mono remap stream %s back to master sink %s",
+                    sink_input_id,
+                    master_sink_name,
+                )
+
     def _route_unmatched_streams_to_default(self, rules: List[Dict]) -> Dict:
         """Move streams that match no rule to the current default sink."""
         default_sink_name = self.device_monitor.get_default_sink()
@@ -559,11 +648,20 @@ class AudioRouterEngine:
             }
 
         default_sink_id, default_sink_name_resolved = resolved
+        effective_default_sink = self._get_effective_target_sink(default_sink_name_resolved)
+        if effective_default_sink != default_sink_name_resolved:
+            effective_resolved = self._resolve_sink(effective_default_sink)
+            if effective_resolved:
+                default_sink_id, default_sink_name_resolved = effective_resolved
         streams = self._get_sink_inputs()
         moved = 0
 
         for stream in streams:
+            if self._is_internal_mono_remap_stream(stream):
+                continue
             app_name = stream.get('application_name', '')
+            if not app_name:
+                continue
             if self._matches_any_rule(app_name, rules):
                 continue
             if stream.get('sink') == default_sink_id:
@@ -687,13 +785,11 @@ class AudioRouterEngine:
             logger.debug(f"PipeWire routing failed: {e}")
             return False
     
-    def _resolve_sink(
-        self,
-        device_name: str,
-        allow_managed_remaps: bool = True,
-    ) -> Optional[Tuple[str, str]]:
+    def _resolve_sink(self, device_name: str) -> Optional[Tuple[str, str]]:
         """Return (sink_index, sink_name); BT ids match by MAC if PipeWire renumbered suffix."""
         try:
+            device_name_lower = (device_name or '').lower()
+            use_bluetooth_fuzzy = device_name_lower.startswith('bluez_output.')
             result = subprocess.run(
                 host_cmd(['pactl', 'list', 'sinks']),
                 capture_output=True,
@@ -707,13 +803,9 @@ class AudioRouterEngine:
                     current_sink_id = line.split('#')[1].strip()
                 elif 'Name:' in line:
                     name_value = line.split('Name:')[1].strip()
-                    if (not allow_managed_remaps) and name_value.startswith(self.MONO_REMAP_PREFIX):
-                        continue
                     if device_name in line or name_value == device_name:
                         return (current_sink_id, name_value)
-                    if 'bluez' in device_name.lower() and 'bluez' in name_value.lower():
-                        if (not allow_managed_remaps) and name_value.startswith(self.MONO_REMAP_PREFIX):
-                            continue
+                    if use_bluetooth_fuzzy and 'bluez' in name_value.lower():
                         parts = device_name.split('.')
                         if len(parts) >= 2:
                             mac_address = parts[1]
